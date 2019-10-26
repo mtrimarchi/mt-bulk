@@ -8,8 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
+	"github.com/migotom/mt-bulk/internal/entities"
 	"github.com/pkg/sftp"
 	cryptossh "golang.org/x/crypto/ssh"
 )
@@ -20,9 +22,10 @@ const SSHDefaultPort = "22"
 // NewSSHClient returns new SSH client.
 func NewSSHClient(config Config) Client {
 	return &SSH{
-		prompt:          regexp.MustCompile(`(?sm)\x1b?\[[A-Za-z0-9!"#$%&'()*+,\-./:;<=>^_]*?@[A-Za-z0-9!"#$%&'()*+,\-./:;<=>^_]*?\] >.{0,1}$`),
-		nonASCIIremover: regexp.MustCompile("[[:^ascii:]]+"),
-		Config:          config,
+		prompt:              regexp.MustCompile(`(?sm)(\x1b)?(\x5b\x39\x39\x39\x39\x42)?\[[A-Za-z0-9!"#$%&'()*+,\-./:;<=>^_]*?@[A-Za-z0-9!"#$%&'()*+,\-./:;<=>^_]*?\] >.{0,1}$`),
+		nonASCIIremover:     regexp.MustCompile("[[:^ascii:]]+"),
+		utf8ArtefactRemover: regexp.MustCompile(`\x1b\x5b\x4b\x0a`),
+		Config:              config,
 	}
 }
 
@@ -31,11 +34,11 @@ type SSH struct {
 	client  *cryptossh.Client
 	session *cryptossh.Session
 
-	stdoutBuf       io.Reader
-	stdinBuf        io.Writer
-	prompt          *regexp.Regexp
-	nonASCIIremover *regexp.Regexp
-
+	stdoutBuf           io.Reader
+	stdinBuf            io.Writer
+	prompt              *regexp.Regexp
+	nonASCIIremover     *regexp.Regexp
+	utf8ArtefactRemover *regexp.Regexp
 	Config
 }
 
@@ -78,12 +81,12 @@ func (ssh *SSH) Connect(ctx context.Context, IP, Port, User, Password string) (e
 }
 
 // CopyFile copies file over SFTP.
-func (ssh *SSH) CopyFile(ctx context.Context, local, remote string) (result string, err error) {
+func (ssh *SSH) CopyFile(ctx context.Context, source, target string) (result entities.CommandResult, err error) {
 	errorChan := make(chan error)
-	responseChan := make(chan string)
+	doneChan := make(chan struct{})
 
 	go func() {
-		defer close(responseChan)
+		defer close(doneChan)
 		defer close(errorChan)
 
 		sftpClient, err := sftp.NewClient(ssh.client)
@@ -92,35 +95,39 @@ func (ssh *SSH) CopyFile(ctx context.Context, local, remote string) (result stri
 		}
 		defer sftpClient.Close()
 
-		// file on remote device
-		rf, err := sftpClient.OpenFile(remote, os.O_CREATE|os.O_WRONLY)
+		rf, err := openFile(sftpClient, target, os.O_CREATE|os.O_WRONLY)
 		if err != nil {
-			errorChan <- fmt.Errorf("SFTP remote file %s error %v", remote, err)
+			errorChan <- fmt.Errorf("target file %s open: %v", target, err)
 		}
 		defer rf.Close()
 
-		// local file
-		lf, err := os.Open(local)
+		lf, err := openFile(sftpClient, source, os.O_RDONLY)
 		if err != nil {
-			errorChan <- fmt.Errorf("local file %s open error %v", local, err)
+			errorChan <- fmt.Errorf("source file %s open: %v", target, err)
 		}
 		defer lf.Close()
 
-		io.Copy(rf, lf)
+		_, err = io.Copy(rf, lf)
+		if err != nil {
+			errorChan <- fmt.Errorf("can't copy: %v", err)
+		}
 
-		responseChan <- fmt.Sprintf("/<mt-bulk>copy sftp://%s %s", local, remote)
+		doneChan <- struct{}{}
 	}()
+
+	result = entities.CommandResult{Body: fmt.Sprintf("/<mt-bulk>copy %s %s", source, target)}
 
 	select {
 	case <-ctx.Done():
-		return "", fmt.Errorf("context cancelled")
+		result.Error = fmt.Errorf("context cancelled")
 	case <-time.After(30 * time.Second):
-		return "", fmt.Errorf("copy file timeouted")
+		result.Error = fmt.Errorf("copy file timeouted")
 	case err := <-errorChan:
-		return "", err
-	case response := <-responseChan:
-		return response, err
+		result.Error = err
+	case <-doneChan:
+		result.Responses = append(result.Responses, result.Body)
 	}
+	return result, result.Error
 }
 
 // Close SSH client session.
@@ -147,7 +154,6 @@ func (ssh *SSH) Close() {
 	case <-time.After(1 * time.Second):
 	case <-wait:
 	}
-	return
 }
 
 // RunCmd executes given command on remote device, optionally can compare execution result with provided expect regexp.
@@ -164,10 +170,11 @@ func (ssh *SSH) RunCmd(body string, expect *regexp.Regexp) (result string, err e
 		result, err = waitForExpected(ssh.stdoutBuf, ssh.prompt)
 	}
 
-	return ssh.prompt.ReplaceAllString(
-		ssh.nonASCIIremover.ReplaceAllString(result, ""),
-		"",
-	), err
+	result = ssh.prompt.ReplaceAllString(result, "")
+	result = ssh.utf8ArtefactRemover.ReplaceAllString(result, "")
+	result = ssh.nonASCIIremover.ReplaceAllString(result, "")
+
+	return result, err
 }
 
 func (ssh *SSH) initializeSession() (err error) {
@@ -203,4 +210,11 @@ func (ssh *SSH) initializeSession() (err error) {
 
 	_, err = waitForExpected(ssh.stdoutBuf, ssh.prompt)
 	return
+}
+
+func openFile(sftpClient *sftp.Client, name string, mode int) (io.ReadWriteCloser, error) {
+	if strings.HasPrefix(name, "sftp://") {
+		return sftpClient.OpenFile(strings.TrimPrefix(name, "sftp://"), mode)
+	}
+	return os.OpenFile(name, mode, 0700)
 }

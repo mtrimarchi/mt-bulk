@@ -10,7 +10,7 @@ import (
 )
 
 // OperationModeFunc represents operation mode function.
-type OperationModeFunc func(context.Context, *zap.SugaredLogger, clients.Client, *entities.Job) ([]entities.CommandResult, error)
+type OperationModeFunc func(context.Context, *zap.SugaredLogger, clients.Client, *entities.Job) ([]entities.CommandResult, []string, error)
 
 const (
 	// ChangePasswordMode is change password operation name.
@@ -25,4 +25,8 @@ const (
 	InitPublicKeySSHMode = "InitPublicKeySSH"
 	// CheckMTbulkVersionMode is check MT-bulk version job operation name.
 	CheckMTbulkVersionMode = "CheckMTbulkVersion"
+	// SFTPMode is SFTP job operation name.
+	SFTPMode = "SFTP"
+	// SystemBackupMode is system backup job operation name.
+	SystemBackupMode = "SystemBackup"
 )
